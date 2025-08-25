@@ -1,5 +1,6 @@
 
 import os
+import struct
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,17 +14,91 @@ HEATMAP_REF_RANGE = np.linspace(60.0, 130.0, 100)
 HEATMAP_SCALE_RANGE = np.linspace(0.5, 1.5, 100)
 
 # -----------------------------------------------------------------------------------
-# 1. Load & Preprocess Function
+# 1. Data Loading Helpers
+# -----------------------------------------------------------------------------------
+def _read_raw_bitlog(path):
+    """Read little-endian raw-bit recordings.
+
+    Each line is expected as ``index,0xID,byte0 byte1 ... byte7`` where the
+    payload represents an IEEE-754 little-endian ``float64`` unless the ID
+    corresponds to the timestamp frame (``0x00A``).  The function aggregates
+    frames into rows using the following mapping:
+
+    ``0x00A`` → ``ESP Time`` (unsigned 64-bit integer)
+    ``0x00B`` → ``Durchschnitt_L_SE``
+    ``0x00C`` → ``Durchschnitt_R_SE``
+    ``0x00D`` → ``Geschwindigkeit``
+    ``0x00E`` → ``Deichsel_Angle``
+    ``0x00F`` → ``Durchschnitt_L_Be_SE``
+    ``0x010`` → ``Durchschnitt_R_Be_SE``
+    ``0x011`` → ``Durchschnitt_L_SE2``
+    ``0x012`` → ``Durchschnitt_R_SE2``
+    ``0x013`` → ``Durchschnitt_L_Be_SE2``
+    ``0x014`` → ``Durchschnitt_R_Be_SE2``
+
+    IDs ``0x015`` and ``0x016`` are currently ignored.  The function returns a
+    DataFrame compatible with the older numeric CSVs.
+    """
+
+    id_map = {
+        0x00B: "Durchschnitt_L_SE",
+        0x00C: "Durchschnitt_R_SE",
+        0x00D: "Geschwindigkeit",
+        0x00E: "Deichsel_Angle",
+        0x00F: "Durchschnitt_L_Be_SE",
+        0x010: "Durchschnitt_R_Be_SE",
+        0x011: "Durchschnitt_L_SE2",
+        0x012: "Durchschnitt_R_SE2",
+        0x013: "Durchschnitt_L_Be_SE2",
+        0x014: "Durchschnitt_R_Be_SE2",
+    }
+    time_id = 0x00A
+
+    rows, current = [], {}
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            parts = [p.strip() for p in line.split(",", 2)]
+            if len(parts) != 3:
+                continue
+            _, id_hex, payload = parts
+            can_id = int(id_hex, 16)
+            data_bytes = bytes.fromhex(payload)
+            if can_id == time_id:
+                if current:
+                    rows.append(current)
+                    current = {}
+                current["ESP Time"] = int.from_bytes(data_bytes, "little")
+            elif can_id in id_map:
+                current[id_map[can_id]] = struct.unpack("<d", data_bytes)[0]
+        if current:
+            rows.append(current)
+
+    return pd.DataFrame(rows)
+
+def _load_recording(path):
+    """Load either the legacy numeric CSV or the new raw-bit format."""
+    with open(path, "r", encoding="utf-8") as fh:
+        first = fh.readline()
+    if ";" in first:
+        return pd.read_csv(path, sep=";")
+    return _read_raw_bitlog(path)
+
+# -----------------------------------------------------------------------------------
+# 2. Load & Preprocess Function
 # -----------------------------------------------------------------------------------
 def load_and_preprocess(path):
-    """Load CSV and preprocess sensor, target, and speed columns.
+    """Load recording and preprocess sensor, target, and speed columns.
 
-    The function automatically detects whether redundant (RC) sensors were used
-    by checking the ``*SE2`` and ``*Be_SE2`` columns. Depending on that, the raw
-    left/right sums are computed with either 2 or 4 sensors per side. The raw
-    hitch angle proxy is then derived from these sums. The function also
-    interpolates zero dropouts in the reference angle, smooths speed, and
-    applies a causal Hampel filter to the raw signal.
+    The function auto-detects whether a file is the legacy semicolon-separated
+    CSV or the new little-endian raw-bit log and loads it accordingly. It then
+    checks whether redundant (RC) sensors were used by inspecting the ``*SE2``
+    and ``*Be_SE2`` columns. Depending on that, the raw left/right sums are
+    computed with either 2 or 4 sensors per side. The raw hitch angle proxy is
+    derived from these sums. The function also interpolates zero dropouts in the
+    reference angle, smooths speed, and applies a causal Hampel filter to the
+    raw signal.
 
     Returns
     -------
@@ -33,7 +108,7 @@ def load_and_preprocess(path):
         Whether redundant sensors were detected in this file.
     """
 
-    df = pd.read_csv(path, sep=';')
+    df = _load_recording(path)
 
     # Identify relevant columns by regex
     angle_col = df.filter(regex='Deichsel').columns[0]
